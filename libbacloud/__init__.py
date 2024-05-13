@@ -4,6 +4,9 @@
 #
 """Simple wrapper so bacloud uses the project virtual environment."""
 from bacloud import run_bacloud_main
+from . import libbacloud
+
+libbacloud.lib_ba_cloud_cython_submodule()
 
 if __name__ == "__main__":
     run_bacloud_main()
