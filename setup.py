@@ -2,11 +2,10 @@
 from setuptools import setup, find_packages, Extension
 from Cython.Build import cythonize
 
-sourcefiles = ["libbacloud/libbacloud.pyx",
-               "libbacloud/bacloud.py",]
+sourcefiles = ["libbacloud/libbacloud.pyx"]
 
 extensions = cythonize(Extension(
-             name="libbacloud/libbacloud",
+             name="libbacloud.libbacloud",
              sources = sourcefiles
       ))
 

@@ -35,6 +35,8 @@ TOOL_NAME = 'bacloud'
 
 TIMEOUT_SECONDS = 60 * 5
 
+VERBOSE = os.environ.get('BACLOUD_VERBOSE') == '1'
+
 # Server we talk to (can override via env var).
 BACLOUD_SERVER = os.getenv('BACLOUD_SERVER', 'ballistica.net')
 
@@ -67,8 +69,8 @@ def run_bacloud_main() -> None:
     try:
         App().run()
     except KeyboardInterrupt:
-        # Let's do a clean fail on keyboard interrupt.
-        # Can make this optional if a backtrace is ever useful.
+        # Let's do a clean fail on keyboard interrupt. Can make this
+        # optional if a backtrace is ever useful.
         sys.exit(1)
     except CleanError as clean_exc:
         clean_exc.pretty_print()
@@ -87,32 +89,18 @@ class App:
         """Run the tool."""
 
         # Make sure we can locate the project bacloud is being run from.
-        self._project_root = Path(sys.argv[0]).parents[1]
-        if not all(
-            Path(self._project_root, name).is_dir()
-            for name in ('tools', 'config', 'tests')
-        ):
-            pass
-            # raise CleanError('Unable to locate project directory.')
-
-        # Also run project env checks so we can hopefully inform the user
-        # of missing Python modules/etc. instead of just failing cryptically.
-        # try:
-        #     subprocess.run(
-        #         ['make', '--quiet', 'env'],
-        #         check=True,
-        #         cwd=self._project_root,
-        #     )
-        # except subprocess.CalledProcessError as exc:
-        #     raise CleanError(
-        #         '"make env" check failed. '
-        #         'Install missing requirements and try again.'
-        #     ) from exc
+        self._project_root = Path(".")
+        # Look for a few things we expect to have in a project.
+#        if not all(
+#            Path(self._project_root, name).exists()
+#            for name in ['config/projectconfig.json', 'tools/batools']
+#        ):
+#            raise CleanError('Unable to locate project directory.')
 
         self._load_state()
 
         # Simply pass all args to the server and let it do the thing.
-        self.run_interactive_command(sys.argv[1:])
+        self.run_interactive_command(cwd=os.getcwd(), args=sys.argv[1:])
 
         self._save_state()
 
@@ -168,39 +156,50 @@ class App:
             ),
         }
 
-        # Trying urllib for comparison (note that this doesn't support
-        # files arg so not actually production ready)
-        if bool(False):
-            import urllib.request
-            import urllib.parse
+        try:
+            # Trying urllib for comparison (note that this doesn't
+            # support files arg so not actually production ready)
+            if bool(False):
+                import urllib.request
+                import urllib.parse
 
-            with urllib.request.urlopen(
-                urllib.request.Request(
-                    url, urllib.parse.urlencode(rdata).encode(), headers
-                )
-            ) as raw_response:
-                if raw_response.getcode() != 200:
-                    raise RuntimeError('Error talking to server')
-                response_content = raw_response.read().decode()
+                with urllib.request.urlopen(
+                    urllib.request.Request(
+                        url, urllib.parse.urlencode(rdata).encode(), headers
+                    )
+                ) as raw_response:
+                    if raw_response.getcode() != 200:
+                        raise RuntimeError('Error talking to server')
+                    response_content = raw_response.read().decode()
 
-        # Using requests module.
-        else:
-            with requests.post(
-                url,
-                headers=headers,
-                data=rdata,
-                files=files,
-                timeout=TIMEOUT_SECONDS,
-            ) as response_raw:
-                response_raw.raise_for_status()
-                assert isinstance(response_raw.content, bytes)
-                response_content = response_raw.content.decode()
+            # Using requests module.
+            else:
+                with requests.post(
+                    url,
+                    headers=headers,
+                    data=rdata,
+                    files=files,
+                    timeout=TIMEOUT_SECONDS,
+                ) as response_raw:
+                    response_raw.raise_for_status()
+                    assert isinstance(response_raw.content, bytes)
+                    response_content = response_raw.content.decode()
+
+        except Exception as exc:
+            if VERBOSE:
+                import traceback
+
+                traceback.print_exc()
+            raise CleanError(
+                'Unable to talk to bacloud server.'
+                ' Set env-var BACLOUD_VERBOSE=1 for details.'
+            ) from exc
 
         assert response_content is not None
         response = dataclass_from_json(ResponseData, response_content)
 
-        # Handle a few things inline.
-        # (so this functionality is available even to recursive commands, etc.)
+        # Handle a few things inline (so this functionality is available
+        # even to recursive commands, etc.)
         if response.message is not None:
             print(response.message, end=response.message_end, flush=True)
 
@@ -211,6 +210,40 @@ class App:
             time.sleep(response.delay_seconds)
 
         return response
+
+    def _download_file(
+        self, filename: str, call: str, args: dict
+    ) -> int | None:
+
+        # Fast out - for repeat batch downloads, most of the time these
+        # will already exist and we can ignore them.
+        if os.path.isfile(filename):
+            return None
+
+        # Update: We now assume all dirs have been created before this
+        # runs. Creating them as we go here could cause race conditions
+        # with multithreaded downloads.
+        dirname = os.path.dirname(filename)
+        assert os.path.isdir(dirname)
+
+        response = self._servercmd(call, args)
+
+        # We currently expect a single 'default' entry in
+        # downloads_inline for this.
+        assert response.downloads_inline is not None
+        assert len(response.downloads_inline) == 1
+        data_zipped = response.downloads_inline.get('default')
+        assert isinstance(data_zipped, bytes)
+
+        data = zlib.decompress(data_zipped)
+
+        # Write to tmp files first and then move into place. This way
+        # crashes are less likely to lead to corrupt data.
+        fnametmp = f'{filename}.tmp'
+        with open(fnametmp, 'wb') as outfile:
+            outfile.write(data)
+        os.rename(fnametmp, filename)
+        return len(data)
 
     def _upload_file(self, filename: str, call: str, args: dict) -> None:
         import tempfile
@@ -252,11 +285,11 @@ class App:
             self._upload_file(filename, uploadcmd, uploadargs)
 
         # Here we can run uploads concurrently if that goes faster...
-        # (should keep an eye on this to make sure its thread safe
-        # and behaves itself)
+        # (should keep an eye on this to make sure its thread safe and
+        # behaves itself)
         with ThreadPoolExecutor(max_workers=4) as executor:
-            # Convert the generator to a list to trigger any
-            # exceptions that occurred.
+            # Convert the generator to a list to surface any exceptions
+            # that occurred.
             list(executor.map(_do_filename, filenames))
 
     def _handle_deletes(self, deletes: list[str]) -> None:
@@ -268,15 +301,15 @@ class App:
 
     def _handle_downloads_inline(
         self,
-        downloads_inline: dict[str, str],
+        downloads_inline: dict[str, bytes],
     ) -> None:
         """Handle inline file data to be saved to the client."""
-        import base64
 
         for fname, fdata in downloads_inline.items():
-            # If there's a directory where we want our file to go, clear it
-            # out first. File deletes should have run before this so
-            # everything under it should be empty and thus killable via rmdir.
+            # If there's a directory where we want our file to go, clear
+            # it out first. File deletes should have run before this so
+            # everything under it should be empty and thus killable via
+            # rmdir.
             if os.path.isdir(fname):
                 for basename, dirnames, _fn in os.walk(fname, topdown=False):
                     for dirname in dirnames:
@@ -286,14 +319,72 @@ class App:
             dirname = os.path.dirname(fname)
             if dirname:
                 os.makedirs(dirname, exist_ok=True)
-            data_zipped = base64.b64decode(fdata)
+            data_zipped = fdata
             data = zlib.decompress(data_zipped)
-            with open(fname, 'wb') as outfile:
+
+            # Write to tmp files first and then move into place. This
+            # way crashes are less likely to lead to corrupt data.
+            fnametmp = f'{fname}.tmp'
+            with open(fnametmp, 'wb') as outfile:
                 outfile.write(data)
+            os.rename(fnametmp, fname)
+
+    def _handle_downloads(self, downloads: ResponseData.Downloads) -> None:
+        from efro.util import data_size_str
+        from concurrent.futures import ThreadPoolExecutor
+
+        starttime = time.monotonic()
+
+        # Minor optimization: avoid repeat mkdir calls for the same path
+        # (we may have lots of stuff in a single dir).
+        prepped_dirs = set[str]()
+
+        def _prep_entry(entry: ResponseData.Downloads.Entry) -> None:
+            fullpath = (
+                entry.path
+                if downloads.basepath is None
+                else os.path.join(downloads.basepath, entry.path)
+            )
+            dirname = os.path.dirname(fullpath)
+            if dirname not in prepped_dirs:
+                os.makedirs(dirname, exist_ok=True)
+                prepped_dirs.add(dirname)
+
+        def _download_entry(entry: ResponseData.Downloads.Entry) -> int | None:
+            allargs = downloads.baseargs | entry.args
+            fullpath = (
+                entry.path
+                if downloads.basepath is None
+                else os.path.join(downloads.basepath, entry.path)
+            )
+            return self._download_file(fullpath, downloads.cmd, allargs)
+
+        # Run a single thread pre-pass to create all needed dirs.
+        # Creating dirs while downloading can introduce race conditions.
+        for entry in downloads.entries:
+            _prep_entry(entry)
+
+        # Run several downloads simultaneously to hopefully maximize
+        # throughput.
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            # Convert the generator to a list to trigger any exceptions
+            # that occurred.
+            results = list(executor.map(_download_entry, downloads.entries))
+
+        num_dls = sum(1 for x in results if x is not None)
+        total_bytes = sum(x for x in results if x is not None)
+        duration = time.monotonic() - starttime
+        if num_dls:
+            print(
+                f'{Clr.BLU}Downloaded {num_dls} files'
+                f' ({data_size_str(total_bytes)}'
+                f' total) in {duration:.2f}s.{Clr.RST}'
+            )
 
     def _handle_dir_prune_empty(self, prunedir: str) -> None:
         """Handle pruning empty directories."""
-        # Walk the tree bottom-up so we can properly kill recursive empty dirs.
+        # Walk the tree bottom-up so we can properly kill recursive
+        # empty dirs.
         for basename, dirnames, filenames in os.walk(prunedir, topdown=False):
             # It seems that child dirs we kill during the walk are still
             # listed when the parent dir is visited, so lets make sure
@@ -335,13 +426,17 @@ class App:
                 print(prompt, end='', flush=True)
             self._end_command_args['input'] = input()
 
-    def run_interactive_command(self, args: list[str]) -> None:
+    def run_interactive_command(self, cwd: str, args: list[str]) -> None:
         """Run a single user command to completion."""
         # pylint: disable=too-many-branches
+        assert self._project_root is not None
+        nextcall: tuple[str, dict] | None = (
+            '_interactive',
+            {'c': cwd, 'p': str(self._project_root), 'a': args},
+        )
 
-        nextcall: tuple[str, dict] | None = ('_interactive', {'a': args})
-
-        # Now talk to the server in a loop until there's nothing left to do.
+        # Now talk to the server in a loop until there's nothing left to
+        # do.
         while nextcall is not None:
             self._end_command_args = {}
             response = self._servercmd(*nextcall)
@@ -353,17 +448,29 @@ class App:
                 self._state.login_token = None
             if response.dir_manifest is not None:
                 self._handle_dir_manifest_response(response.dir_manifest)
-            if response.uploads_inline is not None:
-                self._handle_uploads_inline(response.uploads_inline)
             if response.uploads is not None:
                 self._handle_uploads(response.uploads)
+            if response.uploads_inline is not None:
+                self._handle_uploads_inline(response.uploads_inline)
 
-            # Note: we handle file deletes *before* downloads. This
-            # way our file-download code only has to worry about creating or
-            # removing directories and not files, and corner cases such as
-            # a file getting replaced with a directory should just work.
+            # Note: we handle file deletes *before* downloads. This way
+            # our file-download code only has to worry about creating or
+            # removing directories and not files, and corner cases such
+            # as a file getting replaced with a directory should just
+            # work.
+            #
+            # UPDATE: that actually only applies to commands where the
+            # client uploads a manifest first and then the server
+            # responds with specific deletes and inline downloads. The
+            # newer 'downloads' command is used differently; in that
+            # case the server is just pushing a big list of hashes to
+            # the client and the client is asking for the stuff it
+            # doesn't have. So in that case the client needs to fully
+            # handle things like replacing dirs with files.
             if response.deletes:
                 self._handle_deletes(response.deletes)
+            if response.downloads:
+                self._handle_downloads(response.downloads)
             if response.downloads_inline:
                 self._handle_downloads_inline(response.downloads_inline)
             if response.dir_prune_empty:
@@ -385,5 +492,7 @@ class App:
             if response.end_command is not None:
                 nextcall = response.end_command
                 for key, val in self._end_command_args.items():
-                    # noinspection PyUnresolvedReferences
                     nextcall[1][key] = val
+
+if __name__ == '__main__':
+    run_bacloud_main()
